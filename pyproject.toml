@@ -1,0 +1,25 @@
+[project]
+name = "doc-reconciler"
+version = "0.1.0"
+description = "Deterministic document reconciliation using Pydantic, Streamlit, and PyMuPDF"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.40.0",
+    "pymupdf>=1.24.0",
+    "pydantic>=2.7.0",
+    "pandas>=2.2.0",
+    "openai>=1.30.0",
+    "python-dotenv>=1.0.0",
+    "pillow>=10.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
