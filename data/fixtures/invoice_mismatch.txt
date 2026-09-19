@@ -1,0 +1,11 @@
+INVOICE #INV-2026-9901
+Date: 2026-09-19
+Customer: ACME Corp
+
+Line Items:
+1. Standard Widget | Qty: 1 | Unit Price: $10.00 | Amount: $10.00
+2. Premium Gadget  | Qty: 1 | Unit Price: $15.00 | Amount: $15.00
+
+Subtotal: $26.00
+Tax: $0.00
+Total: $26.00
