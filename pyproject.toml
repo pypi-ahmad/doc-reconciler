@@ -3,6 +3,7 @@ name = "doc-reconciler"
 version = "0.1.0"
 description = "Deterministic document reconciliation using Pydantic, Streamlit, and PyMuPDF"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "streamlit>=1.40.0",

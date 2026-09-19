@@ -88,3 +88,8 @@ doc-reconciler/
     ├── smoke_test.py          # Fast unit and integration tests
     └── test_extract_and_retry.py # Multi-page PDF live test
 ```
+
+## License
+
+This project is licensed under the [MIT License](file:///D:/AI/Github/doc-reconciler/LICENSE).
+
