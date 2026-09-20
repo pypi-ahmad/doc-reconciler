@@ -1,24 +1,240 @@
-"""Extract line items and totals per page using Agnes AI, then merge across pages."""
+"""Strict Agnes extraction into Pydantic invoice models."""
 
 from __future__ import annotations
 
 import json
 import re
-import time
-from typing import Any, Dict, List, Optional, Tuple
-from openai import OpenAI
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
-from src.models import DocumentTotal, LineItem
-from src.agnes_client import DEFAULT_AGNES_MODEL, get_agnes_client, get_available_providers, get_provider_client
+from openai import OpenAI
+from pydantic import ValidationError
+
+from src.agnes_client import DEFAULT_AGNES_MODEL, create_chat_completion
+from src.models import DocumentTotal, ExtractionResult, LineItem
+
+EXTRACTION_PROMPT = """Extract only values explicitly stated in the supplied invoice text.
+Return exactly one JSON object with this schema:
+{
+  "items": [
+    {
+      "sku": null,
+      "desc": "Line description",
+      "qty": 1,
+      "unit_price": 10.00,
+      "amount": 10.00,
+      "page": 1,
+      "raw": "exact source line"
+    }
+  ],
+  "totals": {"subtotal": null, "tax": null, "total": 26.00, "page": 1},
+  "notes": ""
+}
+Use JSON numbers without currency symbols. Use null when a value is absent.
+Preserve stated values even when their arithmetic appears wrong. Never invent or correct values.
+Return JSON only. No Markdown fences, commentary, or extra keys."""
 
 
 def clean_json_text(text: str) -> str:
-    """Strip markdown code fence blocks if present."""
-    text = text.strip()
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-    if match:
-        return match.group(1).strip()
-    return text
+    """Extract the first valid JSON object from plain or fenced model output.
+
+    Args:
+        text: Raw Agnes response content.
+
+    Returns:
+        A serialized JSON object without surrounding prose or Markdown fences.
+
+    Raises:
+        ValueError: If no valid JSON object occurs in the response.
+    """
+    stripped = text.strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", stripped, re.IGNORECASE)
+    candidate = fenced.group(1).strip() if fenced else stripped
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(candidate):
+        if character != "{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(candidate[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return json.dumps(value)
+    raise ValueError("Agnes response did not contain a valid JSON object.")
+
+
+def _decimal_float(value: Any, *, field: str) -> float | None:
+    """Coerce a JSON number or currency-like string through Decimal first."""
+    if value is None or (isinstance(value, str) and value.strip().lower() in {"", "null", "none"}):
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"{field} must be numeric, not boolean.")
+    cleaned = str(value).strip().replace(",", "")
+    negative = cleaned.startswith("(") and cleaned.endswith(")")
+    if negative:
+        cleaned = cleaned[1:-1]
+    cleaned = re.sub(r"^[^\d+\-.]+|[^\d]+$", "", cleaned)
+    try:
+        number = Decimal(cleaned)
+    except InvalidOperation as error:
+        raise ValueError(f"{field} is not a valid number.") from error
+    if not number.is_finite():
+        raise ValueError(f"{field} must be finite.")
+    return float(-number if negative else number)
+
+
+def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize common model variations into the required schema."""
+    raw_items = payload.get("items", payload.get("line_items"))
+    if not isinstance(raw_items, list):
+        raise TypeError("Agnes extraction schema requires an items array.")
+
+    items: list[dict[str, Any]] = []
+    for index, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, dict):
+            raise TypeError(f"items[{index}] must be an object.")
+        item = dict(raw_item)
+        item["desc"] = item.get("desc", item.get("description"))
+        item["qty"] = _decimal_float(item.get("qty"), field=f"items[{index}].qty")
+        item["unit_price"] = _decimal_float(
+            item.get("unit_price", item.get("unit")),
+            field=f"items[{index}].unit_price",
+        )
+        item["amount"] = _decimal_float(item.get("amount"), field=f"items[{index}].amount")
+        item["page"] = int(_decimal_float(item.get("page", 1), field=f"items[{index}].page") or 1)
+        item["raw"] = str(item.get("raw") or "")
+        items.append(item)
+
+    raw_totals = payload.get("totals")
+    if not isinstance(raw_totals, dict):
+        raw_totals = {
+            "subtotal": payload.get("subtotal"),
+            "tax": payload.get("tax"),
+            "total": payload.get("total", payload.get("grand_total", payload.get("page_total"))),
+            "page": payload.get("page", 1),
+        }
+    totals = {
+        name: _decimal_float(raw_totals.get(name), field=f"totals.{name}")
+        for name in ("subtotal", "tax", "total")
+    }
+    totals["page"] = int(_decimal_float(raw_totals.get("page", 1), field="totals.page") or 1)
+    return {"items": items, "totals": totals, "notes": str(payload.get("notes") or "")}
+
+
+def parse_extraction(content: str) -> ExtractionResult:
+    """Parse, normalize, and validate one Agnes response.
+
+    Args:
+        content: Raw JSON-only response or a response containing a JSON fence.
+
+    Returns:
+        Extraction result with Decimal-safe numeric coercion applied.
+
+    Raises:
+        ValueError: If JSON, numeric values, or schema validation are invalid.
+        TypeError: If the payload object or its required items array is invalid.
+    """
+    try:
+        payload = json.loads(clean_json_text(content))
+    except json.JSONDecodeError as error:
+        raise ValueError("Agnes response contained malformed JSON.") from error
+    if not isinstance(payload, dict):
+        raise TypeError("Agnes extraction response must be a JSON object.")
+    try:
+        return ExtractionResult.model_validate(_normalize_payload(payload))
+    except ValidationError as error:
+        raise ValueError(f"Agnes extraction schema validation failed: {error}") from error
+
+
+def extract_text(
+    text: str,
+    *,
+    client: OpenAI | None = None,
+    model: str = DEFAULT_AGNES_MODEL,
+) -> ExtractionResult:
+    """Call Agnes at temperature zero and return a validated extraction.
+
+    Args:
+        text: Concatenated source document text.
+        client: Optional Agnes-compatible client, useful for offline tests.
+        model: Agnes model identifier.
+
+    Returns:
+        Validated line items, stated totals, and extraction notes.
+
+    Raises:
+        ValueError: If text is empty or the provider response is malformed.
+    """
+    if not text.strip():
+        raise ValueError("Document text is empty.")
+    response = create_chat_completion(
+        [
+            {"role": "system", "content": EXTRACTION_PROMPT},
+            {"role": "user", "content": f"Invoice text:\n\n{text}"},
+        ],
+        client=client,
+        model=model,
+    )
+    return parse_extraction(response.choices[0].message.content or "")
+
+
+def _legacy_result(result: ExtractionResult) -> tuple[DocumentTotal, list[LineItem]]:
+    totals = result.totals
+    return (
+        DocumentTotal(
+            subtotal=totals.subtotal,
+            tax=totals.tax,
+            total=totals.total,
+            page=totals.page,
+        ),
+        result.items,
+    )
+
+
+def extract_from_text(
+    raw_text: str,
+    client: OpenAI | None = None,
+    model: str = DEFAULT_AGNES_MODEL,
+) -> tuple[DocumentTotal, list[LineItem]]:
+    """Return the compatibility tuple form of one text extraction.
+
+    Args:
+        raw_text: Source document text.
+        client: Optional Agnes-compatible client.
+        model: Agnes model identifier.
+
+    Returns:
+        The older ``(DocumentTotal, list[LineItem])`` contract.
+
+    Raises:
+        ValueError: If the source or provider response is invalid.
+    """
+    return _legacy_result(extract_text(raw_text, client=client, model=model))
+
+
+def extract_and_merge_document(
+    pages: list[dict[str, Any]],
+    client: OpenAI | None = None,
+    model: str = DEFAULT_AGNES_MODEL,
+) -> tuple[DocumentTotal, list[LineItem]]:
+    """Extract page dictionaries through the compatibility tuple interface.
+
+    Args:
+        pages: Dictionaries containing page numbers and text values.
+        client: Optional Agnes-compatible client.
+        model: Agnes model identifier.
+
+    Returns:
+        The older document-total and line-item tuple.
+
+    Raises:
+        ValueError: If merged text or provider output is invalid.
+    """
+    text = "\n\n".join(
+        f"--- Page {page.get('page', index + 1)} ---\n{page.get('text', '')}"
+        for index, page in enumerate(pages)
+    )
+    return _legacy_result(extract_text(text, client=client, model=model))
 
 
 def extract_page_line_items(
@@ -26,226 +242,23 @@ def extract_page_line_items(
     page_num: int,
     client: OpenAI,
     model: str = DEFAULT_AGNES_MODEL,
-) -> Tuple[List[LineItem], Optional[float], Dict[str, Any]]:
-    """Extract line items and page totals for a single page via Agnes Chat Completions.
+) -> tuple[list[LineItem], float | None, dict[str, Any]]:
+    """Extract one page through the compatibility return contract.
 
-    Returns (line_items, page_stated_total, raw_totals_dict).
+    Args:
+        page_text: Text extracted from one page.
+        page_num: One-based page number to assign to extracted items.
+        client: Agnes-compatible client.
+        model: Agnes model identifier.
+
+    Returns:
+        Extracted items, the stated page total, and serialized totals.
+
+    Raises:
+        ValueError: If page text or provider output is invalid.
     """
-    if not page_text.strip():
-        return [], None, {}
-
-    system_prompt = (
-        "You are an expert financial document data extractor. Extract line items and document totals "
-        "accurately from the provided page text into strict JSON format.\n"
-        "Return ONLY a valid JSON object matching this schema:\n"
-        "{\n"
-        '  "line_items": [\n'
-        "    {\n"
-        '      "description": "Item description or name",\n'
-        '      "qty": 1.0,\n'
-        '      "unit_price": 25.0,\n'
-        '      "amount": 25.0,\n'
-        '      "raw": "Exact raw text line from page for this item"\n'
-        "    }\n"
-        "  ],\n"
-        '  "page_total": 25.0,\n'
-        '  "subtotal": 25.0,\n'
-        '  "tax": 0.0,\n'
-        '  "shipping": 0.0,\n'
-        '  "discount": 0.0,\n'
-        '  "grand_total": 25.0,\n'
-        '  "currency": "USD"\n'
-        "}\n"
-        "Notes:\n"
-        "- If page_total, tax, or other totals are not present on this page, set them to null.\n"
-        "- Do not fabricate figures. Extract exact numbers stated in the text."
-    )
-
-    user_prompt = f"Page {page_num} Text Content:\n\n{page_text}"
-
-    response = None
-    for attempt in range(4):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-            )
-            break
-        except Exception as e:
-            if "rate limit" in str(e).lower() and attempt < 3:
-                time.sleep((attempt + 1) * 3)
-                continue
-            raise
-
-    content = response.choices[0].message.content or "{}" if response else "{}"
-    cleaned = clean_json_text(content)
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        data = {"line_items": []}
-
-    raw_items = data.get("line_items", [])
-    parsed_items: List[LineItem] = []
-    for item in raw_items:
-        try:
-            qty = float(item["qty"]) if item.get("qty") is not None else None
-        except (ValueError, TypeError):
-            qty = None
-        try:
-            unit_price = float(item["unit_price"]) if item.get("unit_price") is not None else None
-        except (ValueError, TypeError):
-            unit_price = None
-        try:
-            amount = float(item["amount"]) if item.get("amount") is not None else None
-        except (ValueError, TypeError):
-            amount = None
-
-        desc = str(item.get("description", "")).strip()
-        raw = str(item.get("raw", "")).strip()
-
-        parsed_items.append(
-            LineItem(
-                qty=qty,
-                unit_price=unit_price,
-                amount=amount,
-                page=page_num,
-                raw=raw,
-                description=desc,
-            )
-        )
-
-    # Page total
-    page_tot = None
-    if data.get("page_total") is not None:
-        try:
-            page_tot = float(data["page_total"])
-        except (ValueError, TypeError):
-            page_tot = None
-    elif data.get("grand_total") is not None:
-        try:
-            page_tot = float(data["grand_total"])
-        except (ValueError, TypeError):
-            page_tot = None
-    elif data.get("subtotal") is not None:
-        try:
-            page_tot = float(data["subtotal"])
-        except (ValueError, TypeError):
-            page_tot = None
-
-    totals_dict = {
-        "subtotal": data.get("subtotal"),
-        "tax": data.get("tax"),
-        "shipping": data.get("shipping"),
-        "discount": data.get("discount"),
-        "grand_total": data.get("grand_total"),
-        "currency": data.get("currency", "USD"),
-        "page_total": page_tot,
-    }
-
-    return parsed_items, page_tot, totals_dict
-
-
-def extract_and_merge_document(
-    pages: List[Dict[str, Any]],
-    client: Optional[OpenAI] = None,
-    model: str = DEFAULT_AGNES_MODEL,
-) -> Tuple[DocumentTotal, List[LineItem]]:
-    """Extract line items per page and merge across all pages of the document."""
-    if client is None:
-        client = get_agnes_client()
-
-    all_line_items: List[LineItem] = []
-    page_totals: Dict[int, float] = {}
-    last_totals_dict: Dict[str, Any] = {}
-
-    for i, page_info in enumerate(pages):
-        p_num = page_info.get("page", i + 1)
-        p_text = page_info.get("text", "")
-
-        # Small pause between pages to respect free tier rate limit
-        if i > 0:
-            time.sleep(1.0)
-
-        items, p_total, totals_dict = extract_page_line_items(
-            page_text=p_text,
-            page_num=p_num,
-            client=client,
-            model=model,
-        )
-
-        all_line_items.extend(items)
-        if p_total is not None:
-            page_totals[p_num] = p_total
-
-        # Save last non-empty totals dict
-        if any(totals_dict.get(k) is not None for k in ["subtotal", "grand_total", "tax", "total"]):
-            last_totals_dict = totals_dict
-
-    # Build DocumentTotal
-    grand_total = None
-    subtotal = None
-    tax = None
-    shipping = None
-    discount = None
-    currency = "USD"
-
-    if last_totals_dict:
-        try:
-            grand_total = float(last_totals_dict.get("grand_total") or last_totals_dict.get("total") or 0.0)
-        except (ValueError, TypeError):
-            grand_total = None
-        try:
-            subtotal = float(last_totals_dict.get("subtotal") or 0.0)
-        except (ValueError, TypeError):
-            subtotal = None
-        try:
-            tax = float(last_totals_dict.get("tax") or 0.0)
-        except (ValueError, TypeError):
-            tax = None
-        try:
-            shipping = float(last_totals_dict.get("shipping") or 0.0)
-        except (ValueError, TypeError):
-            shipping = None
-        try:
-            discount = float(last_totals_dict.get("discount") or 0.0)
-        except (ValueError, TypeError):
-            discount = None
-        currency = last_totals_dict.get("currency", "USD") or "USD"
-
-    doc_total = DocumentTotal(
-        subtotal=subtotal,
-        tax=tax,
-        shipping=shipping,
-        discount=discount,
-        total=grand_total if grand_total is not None else subtotal,
-        currency=currency,
-        page=len(pages),
-        page_totals=page_totals,
-        raw=json.dumps(last_totals_dict),
-    )
-
-    return doc_total, all_line_items
-
-
-def extract_from_text(
-    raw_text: str,
-    client: Optional[OpenAI] = None,
-    model: str = DEFAULT_AGNES_MODEL,
-) -> Tuple[DocumentTotal, List[LineItem]]:
-    """Extract line items and stated totals from plain text invoice/stand-in."""
-    # Split by standard page breaks or treat as single page
-    pages_raw = re.split(r"(?:---+\s*Page\s*\d+\s*---+|\f)", raw_text)
-    pages = [
-        {"page": idx + 1, "text": chunk.strip()}
-        for idx, chunk in enumerate(pages_raw)
-        if chunk.strip()
-    ]
-    if not pages:
-        pages = [{"page": 1, "text": raw_text.strip()}]
-
-    return extract_and_merge_document(pages=pages, client=client, model=model)
+    result = extract_text(page_text, client=client, model=model)
+    for item in result.items:
+        item.page = page_num
+    totals = result.totals.model_dump()
+    return result.items, result.totals.total, totals

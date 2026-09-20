@@ -1,192 +1,172 @@
-"""Deterministic Python checks for document reconciliation (no LLM)."""
+"""Deterministic reconciliation checks. No LLM client belongs in this module."""
 
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import List, Optional, Set, Tuple
-from src.models import (
-    CheckResult,
-    DocumentTotal,
-    LineItem,
-    ReconciliationResult,
-)
+from decimal import ROUND_HALF_UP, Decimal
+
+from src.models import CheckResult, DocumentTotal, LineItem, ReconciliationResult
+
+CENT = Decimal("0.01")
+
+
+def _money(value: float | Decimal) -> Decimal:
+    return Decimal(str(value)).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def _numeric_check(
+    name: str, expected: Decimal, actual: Decimal, tolerance: Decimal, detail: str
+) -> CheckResult:
+    """Build one check using delta = expected/calculated - actual/stated."""
+    delta = (expected - actual).quantize(CENT)
+    return CheckResult(
+        name=name,
+        ok=abs(delta) <= tolerance,
+        expected=float(expected),
+        actual=float(actual),
+        delta=float(delta),
+        detail=detail,
+        discrepancy_amount=float(abs(delta)),
+        numeric_error=(
+            None
+            if abs(delta) <= tolerance
+            else f"{name} expected={expected:.2f} actual={actual:.2f} delta={delta:+.2f}"
+        ),
+    )
 
 
 def check_document(
     doc_total: DocumentTotal,
-    line_items: List[LineItem],
+    line_items: list[LineItem],
     tolerance: float = 0.01,
-) -> List[CheckResult]:
-    """Execute deterministic mathematical checks across extracted document figures.
+) -> list[CheckResult]:
+    """Return individual deterministic checks for a document.
 
-    Returns a list of CheckResult without any LLM calls.
+    Args:
+        doc_total: Stated document totals to compare with line items.
+        line_items: Extracted line items with quantities and stated amounts.
+        tolerance: Maximum allowed absolute numeric delta.
+
+    Returns:
+        Individual check results without their aggregate reconciliation wrapper.
     """
-    res = run_checks(doc_total, line_items, tolerance=tolerance)
-    return res.checks
+    return run_checks(doc_total, line_items, tolerance=tolerance).checks
 
 
 def run_checks(
     doc_total: DocumentTotal,
-    line_items: List[LineItem],
+    line_items: list[LineItem],
     tolerance: float = 0.01,
+    page_totals: dict[int, float] | None = None,
 ) -> ReconciliationResult:
-    """Run deterministic mathematical and integrity checks.
+    """Run sum, row multiplication, duplicate, and optional page-total checks.
 
-    Checks:
-    1. sum(items.amount) vs stated total (tolerance slider, default 0.01)
-    2. qty * unit_price vs amount for each line item
-    3. duplicate rows (descriptions or exact row duplication)
-    4. page-1 total vs last-page total if both exist
+    Args:
+        doc_total: Stated document totals.
+        line_items: Extracted rows to verify.
+        tolerance: Maximum allowed absolute numeric delta.
+        page_totals: Optional stated totals keyed by page number.
+
+    Returns:
+        Aggregate validity, individual results, failed row indices, and retry
+        messages. Numeric deltas use ``expected - actual``.
+
+    Examples:
+        >>> result = run_checks(
+        ...     DocumentTotal(total=26.0),
+        ...     [
+        ...         LineItem(desc="Line A", qty=1, unit_price=10, amount=10),
+        ...         LineItem(desc="Line B", qty=1, unit_price=15, amount=15),
+        ...     ],
+        ... )
+        >>> result.is_valid
+        False
+        >>> next(check.delta for check in result.checks if check.name == "items_sum_vs_total")
+        -1.0
     """
-    checks: List[CheckResult] = []
-    failing_indices: Set[int] = set()
-    numeric_errors: List[str] = []
-    discrepancies: List[str] = []
+    allowed_delta = Decimal(str(tolerance))
+    checks: list[CheckResult] = []
+    failing_indices: set[int] = set()
 
-    # -------------------------------------------------------------------------
-    # Check 1: sum(items.amount) vs stated total
-    # -------------------------------------------------------------------------
-    stated_total = doc_total.total if doc_total.total is not None else doc_total.subtotal
-    if stated_total is not None and line_items:
-        items_with_amount = [it for it in line_items if it.amount is not None]
-        calculated_sum = round(sum(it.amount for it in items_with_amount if it.amount is not None), 2)
-        delta = round(calculated_sum - stated_total, 2)
-        passed = abs(delta) <= tolerance
-        num_err = f"sum={calculated_sum:.2f} total={stated_total:.2f} delta={delta:+.2f}"
+    if doc_total.total is None or not line_items or any(item.amount is None for item in line_items):
+        items_sum = CheckResult(
+            name="items_sum_vs_total",
+            ok=False,
+            detail="A stated total and every line amount are required.",
+        )
+    else:
+        calculated = sum(
+            (_money(item.amount) for item in line_items if item.amount is not None), Decimal("0.00")
+        )
+        items_sum = _numeric_check(
+            "items_sum_vs_total",
+            calculated,
+            _money(doc_total.total),
+            allowed_delta,
+            "Calculated line-item sum compared with stated total.",
+        )
+    checks.append(items_sum)
+    if not items_sum.ok:
+        failing_indices.update(range(len(line_items)))
 
-        if not passed:
-            msg = f"Sum vs Stated Total mismatch: {num_err}"
-            numeric_errors.append(num_err)
-            discrepancies.append(msg)
-            # All items contribute to sum mismatch
-            for i in range(len(line_items)):
-                failing_indices.add(i)
+    for index, item in enumerate(line_items):
+        if item.qty is None or item.unit_price is None or item.amount is None:
+            row_check = CheckResult(
+                name="qty_times_unit_vs_amount",
+                ok=False,
+                detail=f"Row {index} lacks qty, unit_price, or amount.",
+            )
         else:
-            msg = f"Sum of line items ({calculated_sum:.2f}) matches stated total ({stated_total:.2f})."
+            calculated = _money(Decimal(str(item.qty)) * Decimal(str(item.unit_price)))
+            row_check = _numeric_check(
+                "qty_times_unit_vs_amount",
+                calculated,
+                _money(item.amount),
+                allowed_delta,
+                f"Row {index}: qty × unit price compared with stated amount.",
+            )
+        checks.append(row_check)
+        if not row_check.ok:
+            failing_indices.add(index)
 
+    descriptions: dict[str, list[int]] = {}
+    for index, item in enumerate(line_items):
+        description = (item.desc or item.description or "").strip().casefold()
+        if description:
+            descriptions.setdefault(description, []).append(index)
+    duplicate_rows = [indices for indices in descriptions.values() if len(indices) > 1]
+    duplicate_indices = sorted(index for indices in duplicate_rows for index in indices)
+    duplicate_check = CheckResult(
+        name="duplicate_desc",
+        ok=not duplicate_indices,
+        detail=(
+            "No duplicate descriptions found."
+            if not duplicate_indices
+            else f"Duplicate descriptions found on rows {duplicate_indices}."
+        ),
+    )
+    checks.append(duplicate_check)
+    failing_indices.update(duplicate_indices)
+
+    stated_page_totals = page_totals or getattr(doc_total, "page_totals", {})
+    if len(stated_page_totals) >= 2:
+        ordered_pages = sorted(stated_page_totals)
+        first_page = ordered_pages[0]
+        last_page = ordered_pages[-1]
         checks.append(
-            CheckResult(
-                name="Sum vs Stated Total",
-                passed=passed,
-                expected=stated_total,
-                actual=calculated_sum,
-                discrepancy_amount=abs(delta) if not passed else 0.0,
-                numeric_error=num_err if not passed else None,
-                message=msg,
+            _numeric_check(
+                "first_vs_last_total",
+                _money(stated_page_totals[first_page]),
+                _money(stated_page_totals[last_page]),
+                allowed_delta,
+                f"Page {first_page} total compared with page {last_page} total.",
             )
         )
 
-    # -------------------------------------------------------------------------
-    # Check 2: qty * unit_price vs amount for each line item
-    # -------------------------------------------------------------------------
-    for idx, item in enumerate(line_items):
-        if item.qty is not None and item.unit_price is not None and item.amount is not None:
-            expected_amt = round(item.qty * item.unit_price, 2)
-            actual_amt = round(item.amount, 2)
-            diff = round(actual_amt - expected_amt, 2)
-            passed = abs(diff) <= tolerance
-            desc_label = item.description.strip() if item.description else (item.raw.strip() or f"Row {idx}")
-
-            if not passed:
-                num_err = (
-                    f"row={idx} qty={item.qty} unit_price={item.unit_price:.2f} "
-                    f"calculated={expected_amt:.2f} stated={actual_amt:.2f} delta={diff:+.2f}"
-                )
-                msg = (
-                    f"Row {idx} ('{desc_label[:25]}') math error: "
-                    f"{item.qty} x {item.unit_price:.2f} = {expected_amt:.2f}, stated {actual_amt:.2f} (delta={diff:+.2f})"
-                )
-                failing_indices.add(idx)
-                numeric_errors.append(num_err)
-                discrepancies.append(msg)
-            else:
-                msg = f"Row {idx} verified: {item.qty} x {item.unit_price:.2f} = {actual_amt:.2f}"
-
-            checks.append(
-                CheckResult(
-                    name=f"Row {idx} Math ({desc_label[:20]})",
-                    passed=passed,
-                    expected=expected_amt,
-                    actual=actual_amt,
-                    discrepancy_amount=abs(diff) if not passed else 0.0,
-                    numeric_error=num_err if not passed else None,
-                    message=msg,
-                )
-            )
-
-    # -------------------------------------------------------------------------
-    # Check 3: duplicate rows / descriptions
-    # -------------------------------------------------------------------------
-    desc_map: dict[str, list[int]] = defaultdict(list)
-    for idx, item in enumerate(line_items):
-        clean_desc = (item.description or "").strip().lower()
-        if clean_desc and clean_desc not in {"item", "product", "service"}:
-            desc_map[clean_desc].append(idx)
-
-    dup_found = False
-    for desc, indices in desc_map.items():
-        if len(indices) > 1:
-            dup_found = True
-            msg = f"Duplicate rows detected for description '{desc}' across rows {indices}."
-            discrepancies.append(msg)
-            for idx in indices:
-                failing_indices.add(idx)
-            checks.append(
-                CheckResult(
-                    name=f"Duplicate Rows ('{desc[:20]}')",
-                    passed=False,
-                    message=msg,
-                )
-            )
-
-    if not dup_found and line_items:
-        checks.append(
-            CheckResult(
-                name="Duplicate Rows Check",
-                passed=True,
-                message="No duplicate rows or descriptions detected.",
-            )
-        )
-
-    # -------------------------------------------------------------------------
-    # Check 4: page-1 total vs last-page total if both exist
-    # -------------------------------------------------------------------------
-    if doc_total.page_totals:
-        pages = sorted(doc_total.page_totals.keys())
-        if len(pages) >= 2 and 1 in doc_total.page_totals:
-            p1 = 1
-            plast = pages[-1]
-            p1_tot = round(doc_total.page_totals[p1], 2)
-            plast_tot = round(doc_total.page_totals[plast], 2)
-            delta = round(plast_tot - p1_tot, 2)
-            passed = abs(delta) <= tolerance
-            num_err = f"page-1 total={p1_tot:.2f} last-page total={plast_tot:.2f} delta={delta:+.2f}"
-
-            if not passed:
-                msg = f"Page-1 total ({p1_tot:.2f}) differs from last page {plast} total ({plast_tot:.2f}): {num_err}"
-                numeric_errors.append(num_err)
-                discrepancies.append(msg)
-            else:
-                msg = f"Page-1 total ({p1_tot:.2f}) matches last page {plast} total ({plast_tot:.2f})."
-
-            checks.append(
-                CheckResult(
-                    name="First/Last Page Total Mismatch",
-                    passed=passed,
-                    expected=p1_tot,
-                    actual=plast_tot,
-                    discrepancy_amount=abs(delta) if not passed else 0.0,
-                    numeric_error=num_err if not passed else None,
-                    message=msg,
-                )
-            )
-
-    all_passed = len(checks) > 0 and all(c.passed for c in checks)
-
+    failed_checks = [check for check in checks if not check.ok]
     return ReconciliationResult(
-        is_valid=all_passed,
+        is_valid=not failed_checks,
         checks=checks,
         failing_row_indices=sorted(failing_indices),
-        numeric_errors=numeric_errors,
-        discrepancies=discrepancies,
+        numeric_errors=[check.numeric_error for check in failed_checks if check.numeric_error],
+        discrepancies=[check.detail for check in failed_checks],
     )
