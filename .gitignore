@@ -1,9 +1,8 @@
 .env
 .venv/
-data/cache/
+data/
 __pycache__/
 *.py[cod]
-.streamlit/secrets.toml
 .code-review-graph/
 .codegraph/
 .pytest_cache/

@@ -1,253 +1,296 @@
-"""Retry reconciliation loop with Agnes AI targeting only failing rows and numeric errors."""
+"""Bounded Agnes patch loop with deterministic Python verification."""
 
 from __future__ import annotations
 
 import json
-import os
-import re
-import time
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-from openai import OpenAI
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
 
+from openai import OpenAI
+from pydantic import BaseModel, ValidationError
+
+from src.agnes_client import DEFAULT_AGNES_MODEL, create_chat_completion
+from src.checks import run_checks
+from src.extract import clean_json_text
 from src.models import (
     DocumentTotal,
+    DocumentTotals,
     LineItem,
+    ReconcileState,
     ReconciliationResult,
     RetryLogEntry,
 )
-from src.checks import run_checks
-from src.agnes_client import DEFAULT_AGNES_MODEL, get_agnes_client
+
+DEFAULT_CACHE_PATH = Path("data/cache/last_reconcile.json")
+RAW_LOG_LIMIT = 160
 
 
-def clean_json_text(text: str) -> str:
-    """Strip markdown code fence blocks if present."""
-    text = text.strip()
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-    if match:
-        return match.group(1).strip()
-    return text
+class ItemPatch(BaseModel):
+    """Represent a supported correction to one active-pipeline line item.
+
+    Attributes:
+        row_index: Zero-based item index to update.
+        sku: Replacement SKU when supported by source evidence.
+        desc: Replacement description when supported by source evidence.
+        qty: Replacement quantity when supported by source evidence.
+        unit_price: Replacement unit price when supported by source evidence.
+        amount: Replacement amount when supported by source evidence.
+    """
+
+    row_index: int
+    sku: str | None = None
+    desc: str | None = None
+    qty: float | None = None
+    unit_price: float | None = None
+    amount: float | None = None
 
 
-def save_last_reconcile_cache(
-    initial_result: ReconciliationResult,
-    final_result: ReconciliationResult,
-    doc_total: DocumentTotal,
-    line_items: List[LineItem],
-    retry_log: List[RetryLogEntry],
-    cache_path: str = os.path.join("data", "cache", "last_reconcile.json"),
-) -> None:
-    """Save reconciliation audit state to data/cache/last_reconcile.json."""
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    payload = {
-        "timestamp": datetime.now().isoformat(),
-        "is_valid": final_result.is_valid,
-        "initial_failed_checks": [
-            {
-                "name": c.name,
-                "passed": c.passed,
-                "expected": c.expected,
-                "actual": c.actual,
-                "numeric_error": c.numeric_error,
-                "message": c.message,
-            }
-            for c in initial_result.checks
-            if not c.passed
+class TotalsPatch(BaseModel):
+    """Represent supported corrections to active-pipeline stated totals.
+
+    Attributes:
+        subtotal: Replacement stated subtotal.
+        tax: Replacement stated tax.
+        total: Replacement stated grand total.
+        page: Replacement source page.
+    """
+
+    subtotal: float | None = None
+    tax: float | None = None
+    total: float | None = None
+    page: int | None = None
+
+
+class ReconcilePatch(BaseModel):
+    """Represent the narrow JSON patch returned by an Agnes retry request.
+
+    Attributes:
+        items: Optional supported row corrections.
+        totals: Optional supported stated-total corrections.
+    """
+
+    items: list[ItemPatch] | None = None
+    totals: TotalsPatch | None = None
+
+
+def _document_total(totals: DocumentTotals) -> DocumentTotal:
+    return DocumentTotal(
+        subtotal=totals.subtotal,
+        tax=totals.tax,
+        total=totals.total,
+        page=totals.page,
+    )
+
+
+def _sum_message(items: list[LineItem], totals: DocumentTotals) -> str:
+    calculated = sum(
+        (Decimal(str(item.amount)) for item in items if item.amount is not None),
+        Decimal(0),
+    )
+    stated = Decimal(str(totals.total)) if totals.total is not None else Decimal(0)
+    delta = calculated - stated
+    return f"sum(items)={calculated:.2f} stated_total={stated:.2f} delta={delta:+.2f}"
+
+
+def _truncate_raw(row: dict[str, Any]) -> dict[str, Any]:
+    logged = dict(row)
+    raw = str(logged.get("raw") or "")
+    logged["raw"] = raw if len(raw) <= RAW_LOG_LIMIT else f"{raw[: RAW_LOG_LIMIT - 3]}..."
+    return logged
+
+
+def _request_patch(
+    client: OpenAI,
+    model: str,
+    rows: list[dict[str, Any]],
+    totals: DocumentTotals,
+    sum_message: str,
+) -> ReconcilePatch:
+    system_prompt = """Review only the supplied failing extracted rows and stated totals.
+Return one JSON patch with this exact shape:
+{
+  "items": [
+    {"row_index": 0, "sku": null, "desc": null, "qty": null, "unit_price": null, "amount": null}
+  ],
+  "totals": {"subtotal": null, "tax": null, "total": null, "page": null}
+}
+Omit items or totals when no extraction correction is supported by the supplied evidence.
+Never change a stated value merely to force arithmetic to pass. Never declare the checks resolved.
+Python will merge the patch and independently rerun every check. Return JSON only."""
+    user_prompt = (
+        f"Python discrepancy: {sum_message}\n\n"
+        f"Failing rows only:\n{json.dumps(rows, indent=2)}\n\n"
+        f"Stated totals:\n{totals.model_dump_json(indent=2)}"
+    )
+    response = create_chat_completion(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
-        "initial_numeric_errors": initial_result.numeric_errors,
-        "retry_entries": [
+        client=client,
+        model=model,
+    )
+    try:
+        return ReconcilePatch.model_validate_json(
+            clean_json_text(response.choices[0].message.content or "")
+        )
+    except ValidationError as error:
+        raise ValueError(f"Agnes retry patch failed schema validation: {error}") from error
+
+
+def _merge_patch(state: ReconcileState, patch: ReconcilePatch) -> None:
+    for correction in patch.items or []:
+        if not 0 <= correction.row_index < len(state.items):
+            continue
+        item = state.items[correction.row_index]
+        for field in ("sku", "desc", "qty", "unit_price", "amount"):
+            value = getattr(correction, field)
+            if value is not None:
+                setattr(item, field, value)
+        if correction.desc is not None:
+            item.description = correction.desc
+    if patch.totals is not None:
+        for field, value in patch.totals.model_dump(exclude_none=True).items():
+            setattr(state.totals, field, value)
+
+
+def retry_failed_checks(
+    state: ReconcileState,
+    *,
+    tolerance: float = 0.01,
+    max_retries: int = 3,
+    client: OpenAI | None = None,
+    model: str = DEFAULT_AGNES_MODEL,
+) -> ReconcileState:
+    """Retry until Python reports all checks ok or three attempts are exhausted.
+
+    Args:
+        state: Mutable active reconciliation state to check and update.
+        tolerance: Maximum allowed absolute numeric delta.
+        max_retries: Requested retry count, clamped to the range zero through three.
+        client: Optional Agnes-compatible client for tests or custom callers.
+        model: Agnes model identifier.
+
+    Returns:
+        The same state object with latest checks and serialized retry attempts.
+
+    Raises:
+        ValueError: If the provider retry patch cannot satisfy its schema.
+
+    Notes:
+        Python reruns every deterministic check after a patch. A model response
+        never independently marks the reconciliation successful.
+    """
+    retry_limit = min(max(max_retries, 0), 3)
+    current = run_checks(_document_total(state.totals), state.items, tolerance=tolerance)
+    state.checks = current.checks
+    if current.is_valid or retry_limit == 0:
+        return state
+
+    active_client = client
+    for attempt in range(1, retry_limit + 1):
+        if current.is_valid:
+            break
+        if active_client is None:
+            from src.agnes_client import get_agnes_client
+
+            active_client = get_agnes_client()
+
+        indices = current.failing_row_indices
+        rows = [
+            {"row_index": index, **state.items[index].model_dump()}
+            for index in indices
+            if 0 <= index < len(state.items)
+        ]
+        sum_message = _sum_message(state.items, state.totals)
+        failed_before = [check.model_dump() for check in current.checks if not check.ok]
+        patch = _request_patch(active_client, model, rows, state.totals, sum_message)
+        _merge_patch(state, patch)
+        current = run_checks(_document_total(state.totals), state.items, tolerance=tolerance)
+        state.checks = current.checks
+        state.retries.append(
             {
-                "attempt": entry.attempt,
-                "timestamp": entry.timestamp,
-                "model_used": entry.model_used,
-                "failing_rows_sent": entry.failing_rows_sent,
-                "numeric_errors_sent": entry.numeric_errors_sent,
-                "patch_received": entry.patch_received,
-                "resolved": entry.resolved,
-                "notes": entry.notes,
+                "attempt": attempt,
+                "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+                "model": model,
+                "failed_checks": failed_before,
+                "failing_rows": [_truncate_raw(row) for row in rows],
+                "totals": state.totals.model_dump(),
+                "numeric_error": sum_message,
+                "patch": patch.model_dump(exclude_none=True),
+                "checks_after": [check.model_dump() for check in current.checks],
+                "all_ok": current.is_valid,
             }
-            for entry in retry_log
-        ],
-        "final_checks": [
-            {
-                "name": c.name,
-                "passed": c.passed,
-                "numeric_error": c.numeric_error,
-                "message": c.message,
-            }
-            for c in final_result.checks
-        ],
-        "doc_total": doc_total.model_dump(),
-        "line_items": [it.model_dump() for it in line_items],
-    }
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        )
+    return state
 
 
 def retry_reconciliation_loop(
     doc_total: DocumentTotal,
-    line_items: List[LineItem],
+    line_items: list[LineItem],
     tolerance: float = 0.01,
     max_retries: int = 3,
-    client: Optional[OpenAI] = None,
+    client: OpenAI | None = None,
     model: str = DEFAULT_AGNES_MODEL,
-    cache_path: Optional[str] = os.path.join("data", "cache", "last_reconcile.json"),
-) -> Tuple[DocumentTotal, List[LineItem], ReconciliationResult, List[RetryLogEntry]]:
-    """Execute Option B feedback loop:
+    cache_path: str | None = str(DEFAULT_CACHE_PATH),
+) -> tuple[DocumentTotal, list[LineItem], ReconciliationResult, list[RetryLogEntry]]:
+    """Run the active retry loop through the compatibility tuple interface.
 
-    Sends Agnes ONLY the failing rows + the exact numeric error (e.g. "sum=12.40 total=13.00 delta=-0.60").
-    Requests a corrected JSON patch, applies it, and re-runs checks. Up to max_retries (3).
+    Args:
+        doc_total: Detailed compatibility total model to update in place.
+        line_items: Compatibility line items to reconcile.
+        tolerance: Maximum allowed absolute numeric delta.
+        max_retries: Requested retry count, clamped downstream to three.
+        client: Optional Agnes-compatible client for tests or custom callers.
+        model: Agnes model identifier.
+        cache_path: Optional JSON cache output path; ``None`` disables writing.
+
+    Returns:
+        Updated total, updated line items, final deterministic result, and
+        compatibility-format retry log.
+
+    Raises:
+        ValueError: If an Agnes retry patch fails schema validation.
+        OSError: If a configured cache path cannot be written.
     """
-    if client is None:
-        client = get_agnes_client()
-
-    # 1. Initial deterministic check
-    initial_result = run_checks(doc_total, line_items, tolerance=tolerance)
-    current_result = initial_result
-    retry_log: List[RetryLogEntry] = []
-
-    if current_result.is_valid:
-        if cache_path:
-            save_last_reconcile_cache(
-                initial_result=initial_result,
-                final_result=current_result,
-                doc_total=doc_total,
-                line_items=line_items,
-                retry_log=retry_log,
-                cache_path=cache_path,
-            )
-        return doc_total, line_items, current_result, retry_log
-
-    # 2. Retry loop up to max_retries
-    for attempt in range(1, max_retries + 1):
-        failing_indices = current_result.failing_row_indices
-        if not failing_indices:
-            failing_indices = list(range(len(line_items)))
-
-        failing_rows_payload: List[Dict[str, Any]] = [
-            {
-                "row_index": idx,
-                "page": line_items[idx].page,
-                "description": line_items[idx].description,
-                "qty": line_items[idx].qty,
-                "unit_price": line_items[idx].unit_price,
-                "amount": line_items[idx].amount,
-                "raw": line_items[idx].raw,
-            }
-            for idx in failing_indices
-            if 0 <= idx < len(line_items)
-        ]
-
-        numeric_error_text = "\n".join(current_result.numeric_errors) or "; ".join(current_result.discrepancies)
-
-        system_prompt = (
-            "You are a precise financial data reconciliation specialist.\n"
-            "Deterministic checks flagged arithmetic or consistency errors on this document extraction.\n"
-            "You are provided ONLY the failing rows and the exact numeric error.\n"
-            "Re-evaluate the raw snippets, verify arithmetic (qty * unit_price == amount, sum(amounts) == total),\n"
-            "and output a JSON patch to correct the failing rows and/or document total.\n"
-            "Return ONLY valid JSON matching this schema:\n"
-            "{\n"
-            '  "corrected_rows": [\n'
-            "    {\n"
-            '      "row_index": <int>,\n'
-            '      "description": "<corrected description>",\n'
-            '      "qty": <float>,\n'
-            '      "unit_price": <float>,\n'
-            '      "amount": <float>\n'
-            "    }\n"
-            "  ],\n"
-            '  "corrected_total": <float or null>,\n'
-            '  "explanation": "<brief reason for correction>"\n'
-            "}"
+    state = ReconcileState(
+        items=line_items,
+        totals=DocumentTotals(
+            subtotal=doc_total.subtotal,
+            tax=doc_total.tax,
+            total=doc_total.total,
+            page=doc_total.page,
+        ),
+    )
+    retry_failed_checks(
+        state,
+        tolerance=tolerance,
+        max_retries=max_retries,
+        client=client,
+        model=model,
+    )
+    doc_total.subtotal = state.totals.subtotal
+    doc_total.tax = state.totals.tax
+    doc_total.total = state.totals.total
+    doc_total.page = state.totals.page
+    final = run_checks(doc_total, state.items, tolerance=tolerance)
+    logs = [
+        RetryLogEntry(
+            attempt=entry["attempt"],
+            timestamp=entry["timestamp"],
+            model_used=entry["model"],
+            failing_rows_sent=entry["failing_rows"],
+            numeric_errors_sent=[entry["numeric_error"]],
+            patch_received=entry["patch"],
+            resolved=entry["all_ok"],
+            notes="Python reran deterministic checks after this patch.",
         )
-
-        user_prompt = (
-            f"Numeric Errors Detected:\n{numeric_error_text}\n\n"
-            f"Failing Rows Provided:\n{json.dumps(failing_rows_payload, indent=2)}\n\n"
-            "Current Stated Total: "
-            f"{doc_total.total}\n\n"
-            "Please return the JSON patch with corrected row values so all mathematical checks pass."
-        )
-
-        response = None
-        for r_attempt in range(4):
-            try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.0,
-                )
-                break
-            except Exception as e:
-                if "rate limit" in str(e).lower() and r_attempt < 3:
-                    time.sleep((r_attempt + 1) * 3)
-                    continue
-                raise
-
-        content = response.choices[0].message.content or "{}" if response else "{}"
-        cleaned = clean_json_text(content)
-
-        patch_dict: Dict[str, Any] = {}
-        try:
-            patch_dict = json.loads(cleaned)
-        except json.JSONDecodeError:
-            patch_dict = {"explanation": "Invalid JSON returned by model", "corrected_rows": []}
-
-        # Apply patch to line items
-        for corr in patch_dict.get("corrected_rows", []):
-            try:
-                r_idx = int(corr["row_index"])
-                if 0 <= r_idx < len(line_items):
-                    if corr.get("qty") is not None:
-                        line_items[r_idx].qty = float(corr["qty"])
-                    if corr.get("unit_price") is not None:
-                        line_items[r_idx].unit_price = float(corr["unit_price"])
-                    if corr.get("amount") is not None:
-                        line_items[r_idx].amount = float(corr["amount"])
-                    if corr.get("description"):
-                        line_items[r_idx].description = str(corr["description"])
-            except (ValueError, KeyError, TypeError):
-                continue
-
-        # Apply patch to total if specified
-        if patch_dict.get("corrected_total") is not None:
-            try:
-                doc_total.total = float(patch_dict["corrected_total"])
-            except (ValueError, TypeError):
-                pass
-
-        # Re-run checks
-        new_result = run_checks(doc_total, line_items, tolerance=tolerance)
-
-        log_entry = RetryLogEntry(
-            attempt=attempt,
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            model_used=model,
-            failing_rows_sent=failing_rows_payload,
-            numeric_errors_sent=current_result.numeric_errors,
-            patch_received=patch_dict,
-            resolved=new_result.is_valid,
-            notes=f"Attempt {attempt}: {patch_dict.get('explanation', 'Patch applied')}. Result valid: {new_result.is_valid}",
-        )
-        retry_log.append(log_entry)
-
-        current_result = new_result
-        if current_result.is_valid:
-            break
-
-    # Save to cache file
+        for entry in state.retries
+    ]
     if cache_path:
-        save_last_reconcile_cache(
-            initial_result=initial_result,
-            final_result=current_result,
-            doc_total=doc_total,
-            line_items=line_items,
-            retry_log=retry_log,
-            cache_path=cache_path,
-        )
-
-    return doc_total, line_items, current_result, retry_log
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+    return doc_total, state.items, final, logs

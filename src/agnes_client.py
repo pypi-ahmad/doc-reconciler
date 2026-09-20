@@ -1,111 +1,121 @@
-"""Agnes AI client helper and provider configuration.
-
-Base URL: https://apihub.agnes-ai.com/v1
-Default model: agnes-3.0-flash
-Environment variable: AGNESAI_API_KEY (read from user env, never committed or logged)
-"""
+"""Agnes client configuration using the official OpenAI Python SDK."""
 
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
-from typing import List, Optional
-from dotenv import load_dotenv
-from openai import OpenAI
+from typing import Any
 
-# Load local .env if present (names/keys managed by user)
-load_dotenv()
+from openai import APIStatusError, OpenAI, RateLimitError
 
 DEFAULT_AGNES_BASE_URL = "https://apihub.agnes-ai.com/v1"
 DEFAULT_AGNES_MODEL = "agnes-3.0-flash"
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProviderConfig:
-    provider: str
-    model_id: str
-    display_name: str
-    api_key_env: str
-    base_url: Optional[str] = None
+    """Describe the single supported Agnes provider.
+
+    Attributes:
+        provider: Human-readable provider name accepted by compatibility helpers.
+        model_id: Fixed Agnes model used for extraction and retry patches.
+        display_name: UI-friendly provider and model label.
+        api_key_env: Environment variable that supplies the API key.
+        base_url: Fixed compatible OpenAI API endpoint.
+    """
+
+    provider: str = "Agnes AI"
+    model_id: str = DEFAULT_AGNES_MODEL
+    display_name: str = f"Agnes AI: {DEFAULT_AGNES_MODEL}"
+    api_key_env: str = "AGNESAI_API_KEY"
+    base_url: str = DEFAULT_AGNES_BASE_URL
 
 
-def get_agnes_client(api_key: Optional[str] = None) -> OpenAI:
-    """Create official OpenAI Python SDK client targeting Agnes AI endpoint."""
+def get_agnes_client(api_key: str | None = None) -> OpenAI:
+    """Build the fixed Agnes client without logging or persisting its key.
+
+    Args:
+        api_key: Optional caller-supplied key. When omitted, the value comes
+            from ``AGNESAI_API_KEY`` in the current process environment.
+
+    Returns:
+        An OpenAI SDK client configured for the fixed Agnes endpoint.
+
+    Raises:
+        ValueError: If neither ``api_key`` nor the environment variable exists.
+    """
     key = api_key or os.environ.get("AGNESAI_API_KEY")
     if not key:
         raise ValueError(
-            "Missing AGNESAI_API_KEY. Please set the AGNESAI_API_KEY environment variable."
+            "Required environment variable AGNESAI_API_KEY is unavailable; "
+            "relaunch the host if it was recently configured."
         )
-    return OpenAI(
-        api_key=key,
-        base_url=DEFAULT_AGNES_BASE_URL,
-    )
+    return OpenAI(api_key=key, base_url=DEFAULT_AGNES_BASE_URL)
 
 
-def get_available_providers() -> List[ProviderConfig]:
-    """Detect available LLM providers from environment variables without exposing values."""
-    providers: List[ProviderConfig] = []
+def get_available_providers() -> list[ProviderConfig]:
+    """Return Agnes only when its process environment key is present.
 
-    # 1. Agnes AI (Primary default)
-    if os.environ.get("AGNESAI_API_KEY"):
-        providers.append(
-            ProviderConfig(
-                provider="Agnes AI",
-                model_id=DEFAULT_AGNES_MODEL,
-                display_name=f"Agnes AI: {DEFAULT_AGNES_MODEL} (Default)",
-                api_key_env="AGNESAI_API_KEY",
-                base_url=DEFAULT_AGNES_BASE_URL,
-            )
-        )
-
-    # 2. OpenAI provider
-    if os.environ.get("OPENAI_API_KEY"):
-        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        providers.extend([
-            ProviderConfig(
-                provider="OpenAI",
-                model_id="gpt-5.6-luna",
-                display_name="OpenAI: gpt-5.6-luna",
-                api_key_env="OPENAI_API_KEY",
-                base_url=base_url,
-            ),
-            ProviderConfig(
-                provider="OpenAI",
-                model_id="gpt-5.6-terra",
-                display_name="OpenAI: gpt-5.6-terra",
-                api_key_env="OPENAI_API_KEY",
-                base_url=base_url,
-            ),
-        ])
-
-    # 3. Google Gemini provider
-    if os.environ.get("GOOGLE_API_KEY"):
-        providers.extend([
-            ProviderConfig(
-                provider="Google",
-                model_id="gemini-3.5-flash-lite",
-                display_name="Google: gemini-3.5-flash-lite",
-                api_key_env="GOOGLE_API_KEY",
-            ),
-            ProviderConfig(
-                provider="Google",
-                model_id="gemini-3.7-flash",
-                display_name="Google: gemini-3.7-flash",
-                api_key_env="GOOGLE_API_KEY",
-            ),
-        ])
-
-    return providers
+    Returns:
+        A one-element Agnes configuration list, or an empty list when the key
+        is unavailable.
+    """
+    return [ProviderConfig()] if os.environ.get("AGNESAI_API_KEY") else []
 
 
 def get_provider_client(config: ProviderConfig) -> OpenAI:
-    """Instantiate OpenAI client for the given provider configuration."""
-    api_key = os.environ.get(config.api_key_env)
-    if not api_key:
-        raise ValueError(f"Environment variable {config.api_key_env} is not set.")
+    """Create the client for a compatible Agnes provider configuration.
 
-    kwargs: dict = {"api_key": api_key}
-    if config.base_url:
-        kwargs["base_url"] = config.base_url
+    Args:
+        config: Provider configuration returned by ``get_available_providers``.
 
-    return OpenAI(**kwargs)
+    Returns:
+        The fixed Agnes OpenAI SDK client.
+
+    Raises:
+        ValueError: If the provider name or model differs from Agnes Flash.
+    """
+    if config.provider != "Agnes AI" or config.model_id != DEFAULT_AGNES_MODEL:
+        raise ValueError("Only Agnes AI agnes-3.0-flash is supported.")
+    return get_agnes_client()
+
+
+def create_chat_completion(
+    messages: list[dict[str, Any]],
+    *,
+    client: OpenAI | None = None,
+    model: str = DEFAULT_AGNES_MODEL,
+    max_429_retries: int = 3,
+) -> Any:
+    """Create one completion, retrying HTTP 429 responses with bounded backoff.
+
+    Args:
+        messages: OpenAI-compatible chat messages.
+        client: Optional preconfigured client, primarily useful for tests.
+        model: Agnes model identifier.
+        max_429_retries: Number of retries after the first rate-limited request.
+
+    Returns:
+        The SDK completion response.
+
+    Raises:
+        RateLimitError: If every allowed attempt receives HTTP 429.
+        APIStatusError: If the provider returns a non-retriable API error.
+    """
+    active_client = client or get_agnes_client()
+    for retry in range(max_429_retries + 1):
+        try:
+            return active_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.0,
+            )
+        except RateLimitError:
+            if retry == max_429_retries:
+                raise
+        except APIStatusError as error:
+            if error.status_code != 429 or retry == max_429_retries:
+                raise
+        time.sleep(2**retry)
+    raise RuntimeError("Agnes 429 retry loop ended unexpectedly.")

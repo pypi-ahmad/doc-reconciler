@@ -1,93 +1,87 @@
-"""End-to-end test hitting Agnes AI for extraction, deterministic checks, and retry loop."""
+"""Extraction and retry tests with a local fake OpenAI-compatible client."""
 
-import os
-import sys
+from __future__ import annotations
 
-# Ensure repo root is on sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
-from src.pdf_processor import PDFDocument
-from src.extract import extract_and_merge_document
 from src.checks import run_checks
+from src.extract import extract_from_text
 from src.retry import retry_reconciliation_loop
-from src.providers import get_available_providers, get_openai_client
 
 
-def main():
-    print("=" * 60)
-    print("Running Option B: Extract -> Checks -> Agnes Retry Loop")
-    print("=" * 60)
+class FakeCompletions:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self.responses = responses
+        self.requests: list[dict[str, object]] = []
 
-    # 1. Check provider availability
-    providers = get_available_providers()
-    assert providers, "No providers found. Ensure AGNESAI_API_KEY is configured."
-    agnes_opt = next((p for p in providers if p.provider == "Agnes AI"), providers[0])
-    print(f"[1/5] Selected provider: {agnes_opt.display_name}")
-    client = get_openai_client(agnes_opt)
+    def create(self, **kwargs: object) -> SimpleNamespace:
+        self.requests.append(kwargs)
+        content = json.dumps(self.responses.pop(0))
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
-    # 2. Load PDF fixture
-    pdf_path = os.path.join("data", "fixtures", "invoice_mismatch.pdf")
-    assert os.path.exists(pdf_path), f"Fixture not found at {pdf_path}"
-    with open(pdf_path, "rb") as f:
-        file_bytes = f.read()
 
-    pdf_doc = PDFDocument(file_bytes, filename="invoice_mismatch.pdf")
-    pages = pdf_doc.get_all_pages_text()
-    print(f"[2/5] Loaded PDF fixture: {len(pages)} pages detected.")
+class FakeClient:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self.completions = FakeCompletions(responses)
+        self.chat = SimpleNamespace(completions=self.completions)
 
-    # 3. Hit Agnes AI to extract line items per page and merge
-    print("[3/5] Calling Agnes AI to extract per-page line items and merge...")
-    doc_total, line_items = extract_and_merge_document(
-        pages=pages,
-        client=client,
-        model=agnes_opt.model_id,
+
+def test_extraction_then_python_verified_retry(tmp_path) -> None:
+    client = FakeClient(
+        [
+            {
+                "line_items": [
+                    {
+                        "description": "Widget",
+                        "qty": 1,
+                        "unit_price": 10,
+                        "amount": 10,
+                        "raw": "Widget 1 x 10 = 10",
+                    },
+                    {
+                        "description": "Service",
+                        "qty": 1,
+                        "unit_price": 15,
+                        "amount": 15,
+                        "raw": "Service 1 x 15 = 15",
+                    },
+                ],
+                "page_total": 26,
+                "subtotal": 25,
+                "tax": 0,
+                "shipping": 0,
+                "discount": 0,
+                "grand_total": 26,
+                "currency": "USD",
+            },
+            {
+                "items": None,
+                "totals": {"subtotal": None, "tax": None, "total": 25, "page": 1},
+            },
+        ]
     )
+    total, items = extract_from_text("fixture", client=client)
+    initial = run_checks(total, items)
+    assert not initial.is_valid
+    assert "items_sum_vs_total expected=25.00 actual=26.00 delta=-1.00" in initial.numeric_errors
 
-    print(f" -> Extracted {len(line_items)} line items across {len(pages)} pages.")
-    for idx, it in enumerate(line_items):
-        print(f"    Item {idx}: Page {it.page} | '{it.description}' | Qty: {it.qty} | Price: {it.unit_price} | Amount: {it.amount}")
-    print(f" -> Extracted Document Total: {doc_total.total} (Page totals: {doc_total.page_totals})")
-
-    # 4. Run deterministic checks (no LLM)
-    print("[4/5] Running deterministic Python checks...")
-    initial_check = run_checks(doc_total, line_items, tolerance=0.01)
-    print(f" -> Initial checks passed: {initial_check.is_valid}")
-    print(f" -> Numeric errors detected: {initial_check.numeric_errors}")
-    print(f" -> Failing row indices: {initial_check.failing_row_indices}")
-    print(f" -> Discrepancies ({len(initial_check.discrepancies)}):")
-    for d in initial_check.discrepancies:
-        print(f"    * {d}")
-
-    assert not initial_check.is_valid, "Expected initial checks to FAIL on invoice_mismatch.pdf!"
-    assert len(initial_check.numeric_errors) > 0 or len(initial_check.discrepancies) > 0
-
-    # 5. Execute Option B retry loop with Agnes
-    print("[5/5] Executing retry loop with Agnes AI (sending only failing rows + numeric error)...")
-    final_total, final_items, final_check, retry_log = retry_reconciliation_loop(
-        doc_total=doc_total,
-        line_items=line_items,
-        tolerance=0.01,
-        max_retries=3,
+    cache_path = tmp_path / "last_reconcile.json"
+    total, items, final, log = retry_reconciliation_loop(
+        total,
+        items,
         client=client,
-        model=agnes_opt.model_id,
+        max_retries=99,
+        cache_path=str(cache_path),
     )
-
-    print(f" -> Retry loop completed with {len(retry_log)} attempt(s).")
-    for log in retry_log:
-        print(f"\n[RETRY LOG ATTEMPT #{log.attempt}]")
-        print(f"Timestamp: {log.timestamp}")
-        print(f"Model: {log.model_used}")
-        print(f"Numeric Errors Sent:\n  {log.numeric_errors_sent}")
-        print(f"Failing Rows Sent: {len(log.failing_rows_sent)} row(s)")
-        print(f"Patch Received:\n  {log.patch_received}")
-        print(f"Resolved: {log.resolved}")
-        print(f"Notes: {log.notes}")
-
-    print("\n[FINAL RECONCILIATION RESULT]")
-    print(f"Valid: {final_check.is_valid}")
-    print(f"Remaining Discrepancies: {final_check.discrepancies}")
-    print("\nEnd-to-end extract and retry test finished successfully!")
+    assert final.is_valid
+    assert len(log) == 1
+    assert cache_path.exists()
+    retry_prompt = client.completions.requests[1]["messages"][1]["content"]
+    assert "delta=-1.00" in retry_prompt
 
 
-if __name__ == "__main__":
-    main()
+def test_checks_module_has_no_llm_import() -> None:
+    source = Path("src/checks.py").read_text(encoding="utf-8")
+    assert "openai" not in source.lower()
