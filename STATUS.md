@@ -1,48 +1,50 @@
-# Implementation status
+# Status
 
-## Overview
-Doc Reconciler is implemented and verified on Windows 11. Agnes AI handles document extraction and targeted JSON patches, while Python code runs all mathematical checks and calculates error deltas. Python owns the math.
+The Windows-native Streamlit reconciliation pipeline is implemented. Python
+determines arithmetic results.
 
-## Test execution and verification
+## Documentation
 
-### Environment and setup
-- OS: Native Windows 11 (PowerShell / CMD), without Docker or WSL2.
-- Python: 3.14.7 managed via `uv` in `.venv`.
-- Launcher: `run.cmd` verified for `.venv` setup, dependency installation, and `.env.example` copy behavior.
-- Dependencies: Streamlit, PyMuPDF, Pydantic, Pandas, OpenAI SDK, python-dotenv, Pillow. No Qdrant.
+The repository includes onboarding, contributor workflow, a progressive tutorial,
+architecture, checks, and supported Python APIs. Source documentation uses
+Google-style docstrings and labels compatibility wrappers separately.
 
-### Smoke full loop against Agnes AI
-- Command: `uv run python tests/smoke_full_loop.py`
-- Result: Passed (exit code 0).
-  - Loaded deliberate mismatch fixture [`data/fixtures/invoice_mismatch.txt`](file:///D:/AI/Github/doc-reconciler/data/fixtures/invoice_mismatch.txt) (items $10.00 + $15.00 = $25.00 vs printed total $26.00).
-  - Agnes AI (`agnes-3.0-flash`) extracted line items and totals via [`src/extract.py`](file:///D:/AI/Github/doc-reconciler/src/extract.py).
-  - Deterministic checks in [`src/checks.py`](file:///D:/AI/Github/doc-reconciler/src/checks.py) identified the mismatch: `sum=25.00 total=26.00 delta=-1.00`.
-  - Retry loop in [`src/retry.py`](file:///D:/AI/Github/doc-reconciler/src/retry.py) sent only failing rows and the numeric discrepancy to Agnes.
-  - Agnes returned a JSON patch correcting total to $25.00. Python re-evaluated and validated the patch.
-  - Audit state was persisted to [`data/cache/last_reconcile.json`](file:///D:/AI/Github/doc-reconciler/data/cache/last_reconcile.json), verifying at least one failed check and one retry entry.
+## Smoke cache files
 
-### Unit, models, and checks suite
-- Command: `uv run python tests/smoke_test.py`
-- Result: Passed (exit code 0).
-  - Validated Pydantic models: [`LineItem`](file:///D:/AI/Github/doc-reconciler/src/models.py#L10), [`DocumentTotal`](file:///D:/AI/Github/doc-reconciler/src/models.py#L22), [`CheckResult`](file:///D:/AI/Github/doc-reconciler/src/models.py#L38).
-  - Verified 4 deterministic checks without model calls: `sum(items) == total`, `qty * price == amount`, duplicate rows, first/last page total mismatch.
-  - Verified PyMuPDF multi-page rendering and text extraction.
-  - Verified safe provider detection without exposing secrets.
+These local generated artifacts exist under `data/cache/`:
 
-### Streamlit application
-- Command: `uv run python -c "import app; print('app imports verified')"`
-- Result: Passed (exit code 0).
-- Interface includes five tabs:
-  1. Upload: Multi-page preview, image rendering, text document view, extraction trigger.
-  2. Line items: Table of extracted items, raw snippets, and totals.
-  3. Checks: Deterministic check table, numeric error displays, tolerance slider, retry button.
-  4. Retry log: Audit records showing failing rows sent, error strings, and returned patches.
-  5. Export: Downloads for CSV, JSON payload, and Markdown reports.
+| File | Evidence |
+| --- | --- |
+| `last_ingest.json` | Fixture text includes `15.00` and `Total 26.00`. |
+| `last_extract.json` | Two amounts (`10.00`, `15.00`) and stated total `26.00`. |
+| `last_checks.json` | Deterministic arithmetic check results. |
+| `last_reconcile.json` | Full state with extraction, checks, and retry log. |
 
-### Documentation
-- [README.md](file:///D:/AI/Github/doc-reconciler/README.md): Documents the architecture, quickstart, and configuration.
-- [docs/ARCHITECTURE.md](file:///D:/AI/Github/doc-reconciler/docs/ARCHITECTURE.md): Contains the loop diagram and component breakdown.
+## Required mismatch
 
-## Remaining risks and mitigations
-- Network latency: Extraction queries Agnes per page. Documents with more than ten pages will benefit from batched or asynchronous requests.
-- Image-only PDFs: PyMuPDF extracts embedded text directly. Scanned documents without a text layer require an OCR pre-processing step.
+The sum check failed as designed:
+
+```text
+check:    items_sum_vs_total
+expected: 25.00
+actual:   26.00
+delta:    -1.00 (expected - actual)
+ok:       false
+```
+
+The saved reconciliation state contains three retry entries. The final Python
+result still has one failed check. The deliberate mismatch remains visible.
+
+## Verified baseline
+
+- `scripts/smoke_ingest.py` wrote `last_ingest.json`.
+- `scripts/smoke_extract.py` wrote `last_extract.json`.
+- `scripts/smoke_checks.py` confirmed the intended failed sum.
+- `scripts/smoke_reconcile.py` wrote `last_reconcile.json` with three retries
+  and `final_ok=False`.
+- Ruff passed.
+- Pytest passed with 7 tests, and the arithmetic docstring doctest passed.
+- Public `src/` documentation coverage is 52/52 symbols.
+
+See [Onboarding](docs/ONBOARDING.md) for first use and the
+[Contributor runbook](docs/CONTRIBUTOR_RUNBOOK.md) for current commands.
